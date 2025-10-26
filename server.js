@@ -1,4 +1,4 @@
-// server.js
+// server.js (corrigé)
 import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
@@ -9,7 +9,7 @@ import sqlite3 from "sqlite3";
 import { open } from "sqlite";
 import crypto from "crypto";
 import http from "http";
-import WebSocket from "ws";
+import WebSocket, { WebSocketServer } from "ws"; // <-- import both for ESM
 
 dotenv.config();
 
@@ -171,7 +171,7 @@ function requireApiToken(req, res, next) {
    - Server will broadcast payloads to subscribed clients on /api/add
 ------------------------------------------------------------*/
 const httpServer = http.createServer(app);
-const wss = new WebSocket.Server({ server: httpServer, path: "/ws" });
+const wss = new WebSocketServer({ server: httpServer, path: "/ws" }); // use WebSocketServer in ESM
 
 // Map: tfid(string) => Set of ws connections
 const subscribers = new Map();
@@ -194,14 +194,14 @@ function broadcastToTfid(tfid, payload) {
   const data = JSON.stringify(payload);
   for (const ws of s) {
     if (ws.readyState === WebSocket.OPEN) {
-      ws.send(data);
+      try { ws.send(data); } catch(e){ /* ignore send errors */ }
     }
   }
 }
 
 wss.on("connection", (ws, req) => {
   ws.isAlive = true;
-  ws.subscriptions = new Set(); // keep track of tfids this ws subscribed to
+  ws.subscriptions = new Set();
 
   ws.on("pong", () => { ws.isAlive = true; });
 
@@ -222,14 +222,17 @@ wss.on("connection", (ws, req) => {
       removeSubscriber(data.tfid, ws);
       ws.subscriptions.delete(data.tfid);
     } else {
-      // ignore other messages for now
+      // ignore other messages
     }
   });
 
   ws.on("close", () => {
-    // cleanup
     for (const tfid of ws.subscriptions) removeSubscriber(tfid, ws);
     ws.subscriptions.clear();
+  });
+
+  ws.on("error", (err) => {
+    console.warn("WS error", err?.message || err);
   });
 });
 
@@ -238,13 +241,11 @@ const interval = setInterval(() => {
   wss.clients.forEach(ws => {
     if (ws.isAlive === false) return ws.terminate();
     ws.isAlive = false;
-    ws.ping(() => {});
+    try { ws.ping(); } catch(e){ /* ignore */ }
   });
 }, 30000);
 
-/* -------------------- Admin: register frontend --------------------
-   POST /admin/register-frontend
-------------------------------------------------------------------------*/
+/* -------------------- Admin: register frontend -------------------- */
 app.post("/admin/register-frontend", requireApiToken, async (req, res) => {
   const { name, callback_url } = req.body || {};
   if (!name || !/^[a-z0-9\-_]{3,64}$/i.test(name)) return res.status(400).json({ error: "Invalid name (3-64 alnum, -,_ allowed)" });
@@ -321,18 +322,17 @@ app.post("/api/add", async (req, res) => {
     console.warn("Push exception to frontend", frontend.name, err.message);
   }
 
-  // --- NEW: broadcast via WebSocket to subscribers of tfid (recipient) ---
+  // --- broadcast via WebSocket to subscribers of tfid (recipient) ---
   try {
     broadcastToTfid(tfid, { type: "message", ...payload });
-    // optionally: if payload content included a `from` field (JSON string), we can notify sender as well
-    // try to parse content JSON to detect 'from'
+    // if content contains JSON with a "from" tfid, also broadcast to that tfid
     try {
       const parsed = JSON.parse(payload.content);
       if (parsed && parsed.from && isValidTfid(parsed.from)) {
         broadcastToTfid(parsed.from, { type: "message", ...payload });
       }
     } catch(e){
-      // ignore
+      // ignore parse errors
     }
   } catch(e) {
     console.warn("WebSocket broadcast error:", e?.message || e);
