@@ -9,10 +9,7 @@ import { open } from "sqlite";
 import crypto from "crypto";
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
-
-// If running Node < 18, uncomment one of these lines after installing node-fetch or undici
-// import fetch from "node-fetch"; globalThis.fetch ||= fetch;
-// import { fetch } from "undici"; globalThis.fetch ||= fetch;
+import multer from "multer";
 
 dotenv.config();
 
@@ -25,13 +22,27 @@ const GOOGLE_BASE = process.env.GOOGLE_BASE || "https://generativelanguage.googl
 const GOOGLE_MODEL = process.env.GOOGLE_MODEL || "gemini-2.0-flash";
 
 app.use(cors());
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: "10mb" }));
 
 /* -------------------- Simple request logger (debug) -------------------- */
 app.use((req, res, next) => {
   console.log(new Date().toISOString(), req.method, req.url, "origin:", req.headers.origin || "-", "host:", req.headers.host || "-", "x-api-token:", !!req.headers["x-api-token"]);
   next();
 });
+
+/* -------------------- Uploads (multer) -------------------- */
+const UPLOAD_DIR = path.join(process.cwd(), "uploads");
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname || "") || "";
+    const name = Date.now().toString(36) + "-" + Math.floor(Math.random()*1e6).toString(36) + ext;
+    cb(null, name);
+  }
+});
+const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } }); // 50MB limit
+app.use('/uploads', express.static(UPLOAD_DIR));
 
 /* -------------------- DB connectors (sqlite) -------------------- */
 const RAW_DB_URLS = Object.keys(process.env)
@@ -50,15 +61,8 @@ const connectors = RAW_DB_URLS.map((url) => ({ url, conn: null }));
 async function makeSqliteConnector(filePath) {
   await fs.promises.mkdir(path.dirname(filePath), { recursive: true }).catch(() => {});
   const db = await open({ filename: filePath, driver: sqlite3.Database });
-  // Improve concurrency: set WAL and busy timeout
-  try {
-    await db.run("PRAGMA journal_mode = WAL;");
-  } catch (e) {
-    // ignore if not supported
-  }
-  try {
-    await db.run("PRAGMA busy_timeout = 5000;");
-  } catch (e) {}
+  try { await db.run("PRAGMA journal_mode = WAL;"); } catch(e){ }
+  try { await db.run("PRAGMA busy_timeout = 5000;"); } catch(e){ }
   return {
     type: "sqlite",
     db,
@@ -96,6 +100,7 @@ async function ensureTables() {
     const c = await getConnector(i);
     if (!c) continue;
     try {
+      // messages table
       await c.run(`CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tfid TEXT NOT NULL,
@@ -107,6 +112,7 @@ async function ensureTables() {
         blocked INTEGER DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );`);
+      // frontends
       await c.run(`CREATE TABLE IF NOT EXISTS frontends (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL UNIQUE,
@@ -114,6 +120,7 @@ async function ensureTables() {
         secret TEXT NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );`);
+      // blocks
       await c.run(`CREATE TABLE IF NOT EXISTS blocks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         blocker_tfid TEXT NOT NULL,
@@ -121,10 +128,13 @@ async function ensureTables() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(blocker_tfid, blocked_tfid)
       );`);
+      // groups (added avatar_url, bio)
       await c.run(`CREATE TABLE IF NOT EXISTS groups (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL UNIQUE,
         owner_name TEXT,
+        avatar_url TEXT,
+        bio TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );`);
       await c.run(`CREATE TABLE IF NOT EXISTS group_members (
@@ -133,6 +143,7 @@ async function ensureTables() {
         tfid TEXT NOT NULL,
         UNIQUE(group_id, tfid)
       );`);
+      // outgoing pushes
       await c.run(`CREATE TABLE IF NOT EXISTS outgoing_pushes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         message_id INTEGER,
@@ -145,6 +156,15 @@ async function ensureTables() {
         last_attempt_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );`);
+      // reports
+      await c.run(`CREATE TABLE IF NOT EXISTS reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        reported_tfid TEXT NOT NULL,
+        reporter_tfid TEXT,
+        reason TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );`);
+
       okAny = true;
       console.log("Tables ensured on", connectors[i].url);
     } catch (e) {
@@ -345,11 +365,21 @@ app.get("/admin/frontends", requireApiToken, async (req, res) => {
 
 /* -------------------- Group management -------------------- */
 app.post("/admin/groups/create", requireApiToken, async (req, res) => {
-  const { name, owner_name } = req.body || {};
+  const { name, owner_name, bio, avatar_url } = req.body || {};
   if (!name || typeof name !== "string") return res.status(400).json({ error: "Missing group name" });
-  const r = await runWithFallback("INSERT OR IGNORE INTO groups (name, owner_name) VALUES (?, ?)", [name, owner_name || null]);
+  const r = await runWithFallback("INSERT OR IGNORE INTO groups (name, owner_name, avatar_url, bio) VALUES (?, ?, ?, ?)", [name, owner_name || null, avatar_url || null, bio || null]);
   if (!r.ok) return res.status(500).json({ error: r.error });
   res.json({ ok: true, group: name });
+});
+
+app.post("/admin/groups/update", requireApiToken, async (req, res) => {
+  const { group_name, bio, avatar_url } = req.body || {};
+  if (!group_name) return res.status(400).json({ error: "Missing group_name" });
+  const g = await getOneWithFallback("SELECT id FROM groups WHERE name = ? LIMIT 1", [group_name]);
+  if (!g.ok || !g.row) return res.status(400).json({ error: "Group not found" });
+  const r = await runWithFallback("UPDATE groups SET bio = ?, avatar_url = ? WHERE id = ?", [bio || null, avatar_url || null, g.row.id]);
+  if (!r.ok) return res.status(500).json({ error: r.error });
+  res.json({ ok: true });
 });
 
 app.post("/admin/groups/add", requireApiToken, async (req, res) => {
@@ -383,6 +413,63 @@ app.get("/admin/groups/members", requireApiToken, async (req, res) => {
   res.json({ ok: true, members: m.rows.map((r) => r.tfid) });
 });
 
+/* -------------------- Groups listing for a user (API for frontend) -------------------- */
+app.get("/api/groups", async (req, res) => {
+  const tfid = (req.query.tfid || "").toString();
+  if (!isValidTfid(tfid)) return res.status(400).json({ error: "tfid invalid — must be 17 digits" });
+  // find groups where member
+  try {
+    const q = await queryWithFallback(
+      `SELECT g.name, g.owner_name, g.avatar_url, g.bio, g.created_at
+       FROM groups g
+       JOIN group_members gm ON gm.group_id = g.id
+       WHERE gm.tfid = ?
+       ORDER BY g.created_at DESC`,
+      [tfid]
+    );
+    if (!q.ok) return res.status(500).json({ error: q.error });
+    res.json({ ok: true, groups: q.rows });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || String(err) });
+  }
+});
+
+/* -------------------- Group messages listing (for UI) --------------------
+   This endpoint returns messages that contain a JSON field "group":"<group_name>"
+   and match the provided frontend name. Requires tfid to verify membership.
+--------------------------------------------------------------------- */
+app.get("/api/group/messages", async (req, res) => {
+  const group_name = (req.query.group_name || "").toString();
+  const tfid = (req.query.tfid || "").toString();
+  const name = (req.query.name || "").toString();
+  if (!group_name) return res.status(400).json({ error: "Missing group_name" });
+  if (!isValidTfid(tfid)) return res.status(400).json({ error: "tfid invalid — must be 17 digits" });
+  if (!name) return res.status(400).json({ error: "Missing name" });
+
+  // Check membership
+  const g = await getOneWithFallback("SELECT id FROM groups WHERE name = ? LIMIT 1", [group_name]);
+  if (!g.ok || !g.row) return res.status(400).json({ error: "Group not found" });
+  const m = await getOneWithFallback("SELECT 1 FROM group_members WHERE group_id = ? AND tfid = ? LIMIT 1", [g.row.id, tfid]);
+  if (!m.ok) return res.status(403).json({ error: "Not a member of group" });
+
+  // search messages stored for this frontend where content JSON contains "group":"<group_name>"
+  try {
+    const likePattern = `%\"group\":\"${group_name}\"%`;
+    const q = await queryWithFallback(
+      `SELECT id, tfid, name, content, content_type, media_url, source_url, blocked, created_at
+       FROM messages
+       WHERE name = ? AND content LIKE ?
+       ORDER BY created_at DESC
+       LIMIT 100`,
+      [name, likePattern]
+    );
+    if (!q.ok) return res.status(500).json({ error: q.error });
+    res.json({ ok: true, rows: q.rows });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || String(err) });
+  }
+});
+
 /* -------------------- Blocks management -------------------- */
 app.post("/admin/block", requireApiToken, async (req, res) => {
   const { blocker, blocked } = req.body || {};
@@ -398,6 +485,25 @@ app.post("/admin/unblock", requireApiToken, async (req, res) => {
   const r = await runWithFallback("DELETE FROM blocks WHERE blocker_tfid = ? AND blocked_tfid = ?", [blocker, blocked]);
   if (!r.ok) return res.status(500).json({ error: r.error });
   res.json({ ok: true });
+});
+
+/* -------------------- Reports -------------------- */
+app.post("/admin/report", requireApiToken, async (req, res) => {
+  const { reported_tfid, reporter_tfid, reason } = req.body || {};
+  if (!reported_tfid) return res.status(400).json({ error: "Missing reported_tfid" });
+  if (!isValidTfid(reported_tfid)) return res.status(400).json({ error: "reported_tfid invalid — must be 17 digits" });
+  if (reporter_tfid && !isValidTfid(reporter_tfid)) return res.status(400).json({ error: "reporter_tfid invalid — must be 17 digits" });
+  const r = await runWithFallback("INSERT INTO reports (reported_tfid, reporter_tfid, reason) VALUES (?, ?, ?)", [reported_tfid, reporter_tfid || null, reason || null]);
+  if (!r.ok) return res.status(500).json({ error: r.error });
+  res.json({ ok: true });
+});
+
+app.get("/admin/reports/count", requireApiToken, async (req, res) => {
+  const tfid = (req.query.tfid || "").toString();
+  if (!isValidTfid(tfid)) return res.status(400).json({ error: "tfid invalid — must be 17 digits" });
+  const q = await queryWithFallback("SELECT COUNT(*) as c FROM reports WHERE reported_tfid = ?", [tfid]);
+  if (!q.ok) return res.status(500).json({ error: q.error });
+  res.json({ ok: true, count: (q.rows && q.rows[0] && q.rows[0].c) ? q.rows[0].c : 0 });
 });
 
 /* -------------------- Small helper: check if recipient blocked sender -------------------- */
@@ -439,6 +545,18 @@ async function processOutgoingPushes() {
 
 const pushWorkerInterval = setInterval(processOutgoingPushes, 20000); // attempt pending pushes every 20s
 
+/* -------------------- Upload endpoint -------------------- */
+app.post("/upload", upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ ok: false, error: "No file" });
+    const origin = req.protocol + "://" + req.get("host");
+    const url = origin + "/uploads/" + encodeURIComponent(req.file.filename);
+    return res.json({ ok: true, url });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
+});
+
 /* -------------------- Main API: /api/add supports single tfid, array of tfids, or group_name -------------------- */
 app.post("/api/add", async (req, res) => {
   const body = req.body || {};
@@ -446,7 +564,7 @@ app.post("/api/add", async (req, res) => {
   const sender = (body.from || "").toString();
   const name = (body.name || "").toString();
   const rawContent = body.content;
-  const contentType = (body.content_type || "").toString().toLowerCase(); // 'text', 'image', 'video'
+  const contentType = (body.content_type || "").toString().toLowerCase(); // 'text', 'image', 'video', 'group'
   const mediaUrl = body.media_url || null;
 
   if (!name) return res.status(400).json({ error: "Missing name (frontend identifier required)" });
@@ -473,13 +591,13 @@ app.post("/api/add", async (req, res) => {
 
   // sanitize/prepare content
   let content = null;
-  if (contentType === "text" || !contentType) {
-    content = sanitizeText(typeof rawContent === "string" ? rawContent : JSON.stringify(rawContent));
-    if (!content) return res.status(400).json({ error: "Content must be plain text (no empty, no binary). Max 20000 chars." });
+  if (contentType === "text" || !contentType || contentType === "group" || contentType === "card") {
+    content = typeof rawContent === "string" ? sanitizeText(rawContent) : JSON.stringify(rawContent);
+    if (!content) return res.status(400).json({ error: "Content must be plain text/JSON (no empty). Max 20000 chars." });
   } else {
     // for image/video we expect media_url to be provided
     if (!mediaUrl || typeof mediaUrl !== "string") return res.status(400).json({ error: "media_url required for image/video content_type" });
-    content = sanitizeText(typeof rawContent === "string" ? rawContent : (rawContent ? JSON.stringify(rawContent) : "")) || "";
+    content = typeof rawContent === "string" ? sanitizeText(rawContent) : (rawContent ? JSON.stringify(rawContent) : "");
   }
 
   // check frontend mapping
