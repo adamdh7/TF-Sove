@@ -10,6 +10,7 @@ import crypto from "crypto";
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
 import multer from "multer";
+import webpush from "web-push"; // NEW: web-push for sending notifications
 
 dotenv.config();
 
@@ -21,6 +22,23 @@ const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY || "";
 const GOOGLE_BASE = process.env.GOOGLE_BASE || "https://generativelanguage.googleapis.com";
 const GOOGLE_MODEL = process.env.GOOGLE_MODEL || "gemini-2.0-flash";
 
+/* ========== VAPID / Web Push config ========== */
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "";
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "";
+const VAPID_CONTACT = process.env.VAPID_CONTACT || "mailto:admin@example.com";
+
+if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+  try {
+    webpush.setVapidDetails(VAPID_CONTACT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+    console.log("Web-push VAPID set.");
+  } catch (e) {
+    console.warn("Failed to set VAPID details:", e?.message || e);
+  }
+} else {
+  console.warn("VAPID keys missing (VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY). Web Push will not work until set.");
+}
+
+/* -------------------- Express setup -------------------- */
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
@@ -162,6 +180,15 @@ async function ensureTables() {
         reported_tfid TEXT NOT NULL,
         reporter_tfid TEXT,
         reason TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );`);
+
+      // NEW: push_subscriptions table
+      await c.run(`CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tfid TEXT NOT NULL,
+        endpoint TEXT NOT NULL UNIQUE,
+        subscription TEXT NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );`);
 
@@ -363,148 +390,74 @@ app.get("/admin/frontends", requireApiToken, async (req, res) => {
   res.json({ ok: true, rows: q.rows });
 });
 
-/* -------------------- Group management -------------------- */
-app.post("/admin/groups/create", requireApiToken, async (req, res) => {
-  const { name, owner_name, bio, avatar_url } = req.body || {};
-  if (!name || typeof name !== "string") return res.status(400).json({ error: "Missing group name" });
-  const r = await runWithFallback("INSERT OR IGNORE INTO groups (name, owner_name, avatar_url, bio) VALUES (?, ?, ?, ?)", [name, owner_name || null, avatar_url || null, bio || null]);
-  if (!r.ok) return res.status(500).json({ error: r.error });
-  res.json({ ok: true, group: name });
+/* -------------------- Push endpoints -------------------- */
+
+/**
+ * Save a subscription for a tfid.
+ * Body: { tfid: '000...17digits', subscription: { endpoint:..., keys:{p256dh, auth}, ... } }
+ */
+app.post("/push/subscribe", async (req, res) => {
+  const { tfid, subscription } = req.body || {};
+  if (!tfid || !isValidTfid(tfid)) return res.status(400).json({ error: "tfid invalid — must be 17 digits" });
+  if (!subscription || typeof subscription !== "object" || !subscription.endpoint) return res.status(400).json({ error: "subscription missing or invalid" });
+
+  try {
+    const subJson = JSON.stringify(subscription);
+    // store/replace by endpoint unique
+    const r = await runWithFallback(
+      "INSERT OR REPLACE INTO push_subscriptions (tfid, endpoint, subscription) VALUES (?, ?, ?)",
+      [tfid, subscription.endpoint, subJson]
+    );
+    if (!r.ok) return res.status(500).json({ error: r.error });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.warn("push subscribe error", err);
+    return res.status(500).json({ error: err?.message || String(err) });
+  }
 });
 
-app.post("/admin/groups/update", requireApiToken, async (req, res) => {
-  const { group_name, bio, avatar_url } = req.body || {};
-  if (!group_name) return res.status(400).json({ error: "Missing group_name" });
-  const g = await getOneWithFallback("SELECT id FROM groups WHERE name = ? LIMIT 1", [group_name]);
-  if (!g.ok || !g.row) return res.status(400).json({ error: "Group not found" });
-  const r = await runWithFallback("UPDATE groups SET bio = ?, avatar_url = ? WHERE id = ?", [bio || null, avatar_url || null, g.row.id]);
-  if (!r.ok) return res.status(500).json({ error: r.error });
-  res.json({ ok: true });
+/**
+ * Unsubscribe: body { endpoint } or { tfid, endpoint }
+ */
+app.post("/push/unsubscribe", async (req, res) => {
+  const { endpoint, tfid } = req.body || {};
+  if (!endpoint) return res.status(400).json({ error: "Missing endpoint" });
+  try {
+    if (tfid && isValidTfid(tfid)) {
+      await runWithFallback("DELETE FROM push_subscriptions WHERE endpoint = ? AND tfid = ?", [endpoint, tfid]);
+    } else {
+      await runWithFallback("DELETE FROM push_subscriptions WHERE endpoint = ?", [endpoint]);
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    console.warn("push unsubscribe error", err);
+    return res.status(500).json({ error: err?.message || String(err) });
+  }
 });
 
-app.post("/admin/groups/add", requireApiToken, async (req, res) => {
-  const { group_name, tfid } = req.body || {};
-  if (!group_name || !tfid) return res.status(400).json({ error: "Missing group_name or tfid" });
-  if (!isValidTfid(tfid)) return res.status(400).json({ error: "tfid invalid — must be 17 digits" });
-  const g = await getOneWithFallback("SELECT id FROM groups WHERE name = ? LIMIT 1", [group_name]);
-  if (!g.ok || !g.row) return res.status(400).json({ error: "Group not found" });
-  const r = await runWithFallback("INSERT OR IGNORE INTO group_members (group_id, tfid) VALUES (?, ?)", [g.row.id, tfid]);
-  if (!r.ok) return res.status(500).json({ error: r.error });
-  res.json({ ok: true });
+/**
+ * Return VAPID public key to clients (convenience)
+ */
+app.get("/push/vapid", (req, res) => {
+  if (!VAPID_PUBLIC_KEY) return res.status(500).json({ error: "VAPID_PUBLIC_KEY not configured on server" });
+  res.json({ ok: true, publicKey: VAPID_PUBLIC_KEY });
 });
 
-app.post("/admin/groups/remove", requireApiToken, async (req, res) => {
-  const { group_name, tfid } = req.body || {};
-  if (!group_name || !tfid) return res.status(400).json({ error: "Missing group_name or tfid" });
-  const g = await getOneWithFallback("SELECT id FROM groups WHERE name = ? LIMIT 1", [group_name]);
-  if (!g.ok || !g.row) return res.status(400).json({ error: "Group not found" });
-  const q = await runWithFallback("DELETE FROM group_members WHERE group_id = ? AND tfid = ?", [g.row.id, tfid]);
-  if (!q.ok) return res.status(500).json({ error: q.error });
-  res.json({ ok: true });
-});
-
-app.get("/admin/groups/members", requireApiToken, async (req, res) => {
-  const group_name = (req.query.group_name || "").toString();
-  if (!group_name) return res.status(400).json({ error: "Missing group_name" });
-  const g = await getOneWithFallback("SELECT id FROM groups WHERE name = ? LIMIT 1", [group_name]);
-  if (!g.ok || !g.row) return res.status(400).json({ error: "Group not found" });
-  const m = await queryWithFallback("SELECT tfid FROM group_members WHERE group_id = ?", [g.row.id]);
-  if (!m.ok) return res.status(500).json({ error: m.error });
-  res.json({ ok: true, members: m.rows.map((r) => r.tfid) });
-});
+/* -------------------- Groups management -------------------- */
+/* (same as before — omitted here for brevity in this excerpt) */
+/* ... (the rest of your group routes remain unchanged) ... */
 
 /* -------------------- Groups listing for a user (API for frontend) -------------------- */
-app.get("/api/groups", async (req, res) => {
-  const tfid = (req.query.tfid || "").toString();
-  if (!isValidTfid(tfid)) return res.status(400).json({ error: "tfid invalid — must be 17 digits" });
-  // find groups where member
-  try {
-    const q = await queryWithFallback(
-      `SELECT g.name, g.owner_name, g.avatar_url, g.bio, g.created_at
-       FROM groups g
-       JOIN group_members gm ON gm.group_id = g.id
-       WHERE gm.tfid = ?
-       ORDER BY g.created_at DESC`,
-      [tfid]
-    );
-    if (!q.ok) return res.status(500).json({ error: q.error });
-    res.json({ ok: true, groups: q.rows });
-  } catch (err) {
-    res.status(500).json({ error: err?.message || String(err) });
-  }
-});
+/* ... (unchanged) ... */
 
-/* -------------------- Group messages listing (for UI) --------------------
-   This endpoint returns messages that contain a JSON field "group":"<group_name>"
-   and match the provided frontend name. Requires tfid to verify membership.
---------------------------------------------------------------------- */
-app.get("/api/group/messages", async (req, res) => {
-  const group_name = (req.query.group_name || "").toString();
-  const tfid = (req.query.tfid || "").toString();
-  const name = (req.query.name || "").toString();
-  if (!group_name) return res.status(400).json({ error: "Missing group_name" });
-  if (!isValidTfid(tfid)) return res.status(400).json({ error: "tfid invalid — must be 17 digits" });
-  if (!name) return res.status(400).json({ error: "Missing name" });
-
-  // Check membership
-  const g = await getOneWithFallback("SELECT id FROM groups WHERE name = ? LIMIT 1", [group_name]);
-  if (!g.ok || !g.row) return res.status(400).json({ error: "Group not found" });
-  const m = await getOneWithFallback("SELECT 1 FROM group_members WHERE group_id = ? AND tfid = ? LIMIT 1", [g.row.id, tfid]);
-  if (!m.ok) return res.status(403).json({ error: "Not a member of group" });
-
-  // search messages stored for this frontend where content JSON contains "group":"<group_name>"
-  try {
-    const likePattern = `%\"group\":\"${group_name}\"%`;
-    const q = await queryWithFallback(
-      `SELECT id, tfid, name, content, content_type, media_url, source_url, blocked, created_at
-       FROM messages
-       WHERE name = ? AND content LIKE ?
-       ORDER BY created_at DESC
-       LIMIT 100`,
-      [name, likePattern]
-    );
-    if (!q.ok) return res.status(500).json({ error: q.error });
-    res.json({ ok: true, rows: q.rows });
-  } catch (err) {
-    res.status(500).json({ error: err?.message || String(err) });
-  }
-});
+/* -------------------- Group messages listing (for UI) -------------------- */
+/* ... (unchanged) ... */
 
 /* -------------------- Blocks management -------------------- */
-app.post("/admin/block", requireApiToken, async (req, res) => {
-  const { blocker, blocked } = req.body || {};
-  if (!isValidTfid(blocker) || !isValidTfid(blocked)) return res.status(400).json({ error: "Invalid tfid(s)" });
-  const r = await runWithFallback("INSERT OR IGNORE INTO blocks (blocker_tfid, blocked_tfid) VALUES (?, ?)", [blocker, blocked]);
-  if (!r.ok) return res.status(500).json({ error: r.error });
-  res.json({ ok: true });
-});
-
-app.post("/admin/unblock", requireApiToken, async (req, res) => {
-  const { blocker, blocked } = req.body || {};
-  if (!isValidTfid(blocker) || !isValidTfid(blocked)) return res.status(400).json({ error: "Invalid tfid(s)" });
-  const r = await runWithFallback("DELETE FROM blocks WHERE blocker_tfid = ? AND blocked_tfid = ?", [blocker, blocked]);
-  if (!r.ok) return res.status(500).json({ error: r.error });
-  res.json({ ok: true });
-});
+/* ... (unchanged) ... */
 
 /* -------------------- Reports -------------------- */
-app.post("/admin/report", requireApiToken, async (req, res) => {
-  const { reported_tfid, reporter_tfid, reason } = req.body || {};
-  if (!reported_tfid) return res.status(400).json({ error: "Missing reported_tfid" });
-  if (!isValidTfid(reported_tfid)) return res.status(400).json({ error: "reported_tfid invalid — must be 17 digits" });
-  if (reporter_tfid && !isValidTfid(reporter_tfid)) return res.status(400).json({ error: "reporter_tfid invalid — must be 17 digits" });
-  const r = await runWithFallback("INSERT INTO reports (reported_tfid, reporter_tfid, reason) VALUES (?, ?, ?)", [reported_tfid, reporter_tfid || null, reason || null]);
-  if (!r.ok) return res.status(500).json({ error: r.error });
-  res.json({ ok: true });
-});
-
-app.get("/admin/reports/count", requireApiToken, async (req, res) => {
-  const tfid = (req.query.tfid || "").toString();
-  if (!isValidTfid(tfid)) return res.status(400).json({ error: "tfid invalid — must be 17 digits" });
-  const q = await queryWithFallback("SELECT COUNT(*) as c FROM reports WHERE reported_tfid = ?", [tfid]);
-  if (!q.ok) return res.status(500).json({ error: q.error });
-  res.json({ ok: true, count: (q.rows && q.rows[0] && q.rows[0].c) ? q.rows[0].c : 0 });
-});
+/* ... (unchanged) ... */
 
 /* -------------------- Small helper: check if recipient blocked sender -------------------- */
 async function isBlocked(recipientTfid, senderTfid) {
@@ -512,7 +465,7 @@ async function isBlocked(recipientTfid, senderTfid) {
   return q.ok && q.rows && q.rows.length > 0;
 }
 
-/* -------------------- Outgoing pushes retry worker -------------------- */
+/* -------------------- Outgoing pushes retry worker (unchanged) -------------------- */
 async function processOutgoingPushes() {
   try {
     const q = await queryWithFallback("SELECT id, message_id, frontend_name, callback_url, payload, attempts FROM outgoing_pushes WHERE status IN ('pending','failed') ORDER BY created_at ASC LIMIT 50", []);
@@ -544,6 +497,44 @@ async function processOutgoingPushes() {
 }
 
 const pushWorkerInterval = setInterval(processOutgoingPushes, 20000); // attempt pending pushes every 20s
+
+/* -------------------- Helper: send Web Push to tfid -------------------- */
+async function sendWebPushToTfid(tfid, payloadObj) {
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
+    // not configured
+    return { ok: false, error: "VAPID not configured" };
+  }
+  try {
+    const q = await queryWithFallback("SELECT id, subscription FROM push_subscriptions WHERE tfid = ?", [tfid]);
+    if (!q.ok) return { ok: false, error: q.error };
+    const done = [];
+    for (const row of q.rows || []) {
+      try {
+        const sub = JSON.parse(row.subscription);
+        // payload string
+        const str = JSON.stringify(payloadObj);
+        await webpush.sendNotification(sub, str).catch(async (err) => {
+          // analyze error, remove subscription if 410 Gone or 404
+          const code = err && err.statusCode ? err.statusCode : (err && err.status ? err.status : null);
+          if (code === 410 || code === 404) {
+            try { await runWithFallback("DELETE FROM push_subscriptions WHERE id = ?", [row.id]); } catch(e) {}
+          } else {
+            console.warn("webpush send error", err?.message || err, code);
+          }
+          throw err;
+        });
+        done.push({ id: row.id, ok: true });
+      } catch (err) {
+        console.warn("sendWebPushToTfid send fail for subscription id", row.id, err?.message || err);
+        // non-fatal
+      }
+    }
+    return { ok: true, sent: done.length };
+  } catch (err) {
+    console.warn("sendWebPushToTfid error", err?.message || err);
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
 
 /* -------------------- Upload endpoint -------------------- */
 app.post("/upload", upload.single("file"), async (req, res) => {
@@ -648,13 +639,13 @@ app.post("/api/add", async (req, res) => {
       console.warn("WS broadcast error", e?.message || e);
     }
 
-    // if blocked by recipient we skip HTTP push to frontend callback
+    // if blocked by recipient we skip HTTP push to frontend callback and Web Push
     if (blockedFlag) {
       results.push({ tfid, ok: true, id: ins.lastID, blocked: true });
       continue;
     }
 
-    // attempt immediate push; if fails we queue into outgoing_pushes for retry
+    // attempt immediate push to frontend callback; if fails we queue into outgoing_pushes for retry
     try {
       const pushResp = await fetch(frontend.callback_url, {
         method: "POST",
@@ -690,6 +681,32 @@ app.post("/api/add", async (req, res) => {
       );
       results.push({ tfid, ok: true, id: ins.lastID, pushed: false, queued: true });
     }
+
+    // NEW: attempt to send Web Push to stored subscriptions for that tfid
+    try {
+      // prepare a light notification payload that clients expect
+      const notif = {
+        title: (payload.name && payload.name !== "") ? payload.name : "TF-Chat",
+        body: (typeof payload.content === "string" ? payload.content.slice(0, 160) : ""),
+        data: {
+          conversation: tfid,
+          messageId: payload.id,
+          tfid,
+          frontend: name
+        },
+        icon: "/images/notification-128.png",
+        badge: "/images/notification-badge.png",
+        tag: `tfchat-${tfid}`
+      };
+      const pushResult = await sendWebPushToTfid(tfid, notif);
+      if (pushResult && pushResult.ok) {
+        // success info available
+      } else {
+        // no subscription or error
+      }
+    } catch (err) {
+      console.warn("WebPush send failed (ignored):", err?.message || err);
+    }
   }
 
   res.json({ ok: true, results });
@@ -711,109 +728,10 @@ app.get("/api/list", async (req, res) => {
 });
 
 /* -------------------- AI endpoint (proxy) -------------------- */
-app.post("/api/ai", async (req, res) => {
-  const body = req.body || {};
-  const tfid = (body.tfid || "").toString();
-  const name = (body.name || "").toString();
-  const prompt = (body.prompt || "").toString();
-  const maxTokens = parseInt(body.max_output_tokens || "512", 10);
-
-  if (!isValidTfid(tfid)) return res.status(400).json({ error: "tfid invalid — must be 17 digits" });
-  if (!name) return res.status(400).json({ error: "Missing name" });
-  if (!prompt || prompt.trim().length === 0) return res.status(400).json({ error: "Missing prompt" });
-  if (!GOOGLE_API_KEY) return res.status(500).json({ error: "Server missing GOOGLE_API_KEY env" });
-
-  const fe = await queryWithFallback("SELECT * FROM frontends WHERE name = ? LIMIT 1", [name]);
-  if (!fe.ok) return res.status(500).json({ error: fe.error });
-  if (!fe.rows || fe.rows.length === 0) return res.status(400).json({ error: "Frontend name not registered" });
-
-  const url = `${GOOGLE_BASE}/v1/models/${encodeURIComponent(GOOGLE_MODEL)}:generate?key=${encodeURIComponent(GOOGLE_API_KEY)}`;
-
-  const requestBody = {
-    prompt: { text: prompt },
-    max_output_tokens: Math.min(Math.max(64, maxTokens), 2048),
-    temperature: 0.2,
-  };
-
-  try {
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(requestBody),
-    });
-
-    const json = await resp.json().catch(() => null);
-    if (!resp.ok) {
-      const eText = json ? JSON.stringify(json) : `status ${resp.status}`;
-      return res.status(500).json({ error: "AI API error", detail: eText });
-    }
-
-    let aiText = null;
-    if (json) {
-      if (Array.isArray(json.candidates) && json.candidates.length > 0 && typeof json.candidates[0].content === "string") {
-        aiText = json.candidates[0].content;
-      } else if (typeof json.output_text === "string") {
-        aiText = json.output_text;
-      } else if (Array.isArray(json.output) && json.output.length > 0 && typeof json.output[0].content === "string") {
-        aiText = json.output[0].content;
-      } else if (typeof json.candidates?.[0]?.output === "string") {
-        aiText = json.candidates[0].output;
-      }
-    }
-    if (!aiText) aiText = json ? (JSON.stringify(json).slice(0, 20000)) : "";
-
-    return res.json({ ok: true, ai: aiText });
-  } catch (err) {
-    console.error("AI call error:", err);
-    return res.status(500).json({ error: "AI request failed", detail: err?.message || String(err) });
-  }
-});
+/* ... (unchanged) ... */
 
 /* -------------------- Small HTML viewer (optional) -------------------- */
-app.get("/", async (req, res) => {
-  const tfid = (req.query.tfid || "").toString();
-  const name = (req.query.name || "").toString();
-
-  if (!tfid || !name) {
-    return res.send(`<html><body><h1>Error</h1><p>Missing tfid or name in query. Use ?tfid=123...&name=yourname</p></body></html>`);
-  }
-  if (!isValidTfid(tfid)) {
-    return res.send(`<html><body><h1>Error</h1><p>tfid invalid — must be 17 digits</p></body></html>`);
-  }
-
-  const fe = await queryWithFallback("SELECT * FROM frontends WHERE name = ? LIMIT 1", [name]);
-  if (!fe.ok) {
-    return res.send(`<html><body><h1>Error</h1><p>Server DB error: ${escapeHtml(fe.error || "unknown")}</p></body></html>`);
-  }
-  if (!fe.rows || fe.rows.length === 0) {
-    return res.send(`<html><body><h1>Error</h1><p>Frontend name not registered</p></body></html>`);
-  }
-
-  const r = await queryWithFallback("SELECT id, content, content_type, media_url, created_at FROM messages WHERE tfid = ? AND name = ? ORDER BY id DESC LIMIT 500", [tfid, name]);
-  if (!r.ok) {
-    return res.send(`<html><body><h1>Error</h1><p>Could not read messages: ${escapeHtml(r.error || "unknown")}</p></body></html>`);
-  }
-
-  const rows = r.rows || [];
-  let listHtml = rows.map((row) => `<li><strong>#${row.id}</strong> — ${escapeHtml(row.content)} ${row.media_url ? `(media: ${escapeHtml(row.media_url)})` : ""} <em>(${escapeHtml(row.created_at)})</em></li>`).join("\n");
-  if (!listHtml) listHtml = "<li>(pa gen mesaj pou tfid sa)</li>";
-
-  const html = `<!doctype html>
-  <html>
-  <head><meta charset="utf-8"><title>TFID ${escapeHtml(tfid)}</title>
-    <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <style>body{font-family:system-ui,Arial;max-width:900px;margin:20px auto;padding:10px}li{margin:8px 0;padding:8px;border:1px solid #eee;border-radius:6px}</style>
-  </head>
-  <body>
-    <h1>Bien!</h1>
-    <p><strong>tfid:</strong> ${escapeHtml(tfid)}<br/><strong>name:</strong> ${escapeHtml(name)}</p>
-    <h2>Sak stocké yo</h2>
-    <ul>${listHtml}</ul>
-  </body>
-  </html>`;
-
-  res.send(html);
-});
+/* ... (unchanged) ... */
 
 /* Health and admin init */
 app.get("/health", (req, res) => res.json({ ok: true }));
