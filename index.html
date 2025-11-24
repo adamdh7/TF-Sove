@@ -1,0 +1,293 @@
+<!doctype html>
+
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>TF-Stream/Name</title>
+<style>
+  :root{
+    --bg:#000;
+    --card:#0b0b0b;
+    --muted:#9aa0a6;
+    --accent:#30b6ff;
+    --radius:12px;
+    --gap:12px;
+  }
+  html,body{height:100%;margin:0;background:var(--bg);color:#fff;font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial; -webkit-font-smoothing:antialiased;}
+  .wrap{max-width:980px;margin:22px auto;padding:18px;}
+  header{display:flex;align-items:center;gap:12px}
+  h1{font-size:20px;margin:0}
+  .sub{color:var(--muted);font-size:13px;margin-top:4px}
+  .controls{display:flex;gap:10px;margin-top:16px;align-items:center;flex-wrap:wrap}
+  .btn{background:linear-gradient(#111,#0b0b0b);border:1px solid rgba(255,255,255,0.04);padding:10px 14px;border-radius:12px;color:#fff;cursor:pointer;font-weight:600}
+  .file-input{display:inline-block;position:relative;overflow:hidden}
+  .file-input input{position:absolute;inset:0;opacity:0;cursor:pointer}
+  .search{flex:1;min-width:220px;padding:12px 14px;border-radius:12px;border:1px solid rgba(255,255,255,0.06);background:#070707;color:#fff;font-size:15px;outline:none}
+  .panel{margin-top:16px;background:var(--card);border-radius:14px;padding:12px;border:1px solid rgba(255,255,255,0.03)}
+  .info{display:flex;justify-content:space-between;align-items:center;color:var(--muted);font-size:13px}
+  #list{margin-top:10px;max-height:62vh;overflow:auto;padding-right:6px}
+  .file-block{border-radius:10px;padding:10px;background:linear-gradient(180deg, rgba(255,255,255,0.02), transparent);margin-bottom:12px}
+  .file-name{font-weight:700;font-size:14px}
+  .found-item{padding:8px 10px;border-radius:8px;margin-top:8px;background:rgba(255,255,255,0.02);display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap}
+  .line{color:var(--accent);font-weight:700;min-width:96px}
+  .value{flex:1;color:#fff;word-break:break-word}
+  .muted{color:var(--muted);font-size:13px}
+  .empty{padding:36px;text-align:center;color:var(--muted)}
+  .drop-hint{border:2px dashed rgba(255,255,255,0.03);padding:10px;border-radius:10px;text-align:center;color:var(--muted);margin-top:10px}
+  .actions{display:flex;gap:8px}
+  #list::-webkit-scrollbar{width:8px}
+  #list::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.03);border-radius:8px}
+  @media (max-width:560px){ .controls{flex-direction:column;align-items:stretch} .actions{justify-content:space-between} }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>TF-Stream/Name</h1>
+        <div class="sub">Charger des fichiers JSON ; recherche : <strong>Titre / titre / Name / name</strong></div>
+      </div>
+    </header><div class="controls">
+  <label class="btn file-input">
+    Charger JSON
+    <input id="fileInput" type="file" accept=".json,application/json" multiple>
+  </label>
+
+  <div class="drop-hint btn" id="dropZone" title="Déposez des fichiers ici">Ou déposer des fichiers ici</div>
+
+  <input id="search" class="search" placeholder="Recherche (ex: nom, titre) — Entrée pour filtrer / Effacer pour tout afficher">
+
+  <div class="actions">
+    <button id="copyAll" class="btn">Copier tous</button>
+    <button id="exportTxt" class="btn">Exporter (TXT)</button>
+    <button id="clearBtn" class="btn">Effacer</button>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="info">
+    <div><span id="fileCount">0 fichiers</span> • <span id="matchCount">0 résultats</span></div>
+    <div class="muted">Affichage : <span id="displayCount">0</span></div>
+  </div>
+
+  <div id="list">
+    <div class="empty">Aucun fichier chargé — clique sur <strong>Charger JSON</strong> ou fais glisser des fichiers .json</div>
+  </div>
+</div>
+
+  </div><script>
+const fileInput = document.getElementById('fileInput');
+const dropZone = document.getElementById('dropZone');
+const listEl = document.getElementById('list');
+const searchInput = document.getElementById('search');
+const fileCountEl = document.getElementById('fileCount');
+const matchCountEl = document.getElementById('matchCount');
+const displayCountEl = document.getElementById('displayCount');
+const copyAllBtn = document.getElementById('copyAll');
+const exportTxtBtn = document.getElementById('exportTxt');
+const clearBtn = document.getElementById('clearBtn');
+
+let filesData = new Map(); // filename -> { text, hits: [{line, name, path}] }
+
+fileInput.addEventListener('change', async (e) => {
+  const files = Array.from(e.target.files || []);
+  await handleFiles(files);
+  fileInput.value = '';
+});
+
+dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.style.opacity = '0.8'; });
+dropZone.addEventListener('dragleave', (e) => { dropZone.style.opacity = '1'; });
+dropZone.addEventListener('drop', async (e) => {
+  e.preventDefault();
+  dropZone.style.opacity = '1';
+  const items = Array.from(e.dataTransfer.files || []);
+  await handleFiles(items);
+});
+
+async function handleFiles(fileList){
+  if(!fileList || fileList.length === 0) return;
+  for(const f of fileList){
+    if(!f.name.toLowerCase().endsWith('.json')) continue;
+    try{
+      const text = await f.text();
+      const hits = extractTitlesFromJsonText(text);
+      filesData.set(f.name, { text, hits });
+    }catch(err){
+      console.warn('Erreur lecture fichier', f.name, err);
+    }
+  }
+  render();
+}
+
+function extractTitlesFromJsonText(text){
+  const results = [];
+  const matchKey = k => /^(titre|name)$/i.test(k);
+  try {
+    const parsed = JSON.parse(text);
+    function recurse(obj, path){
+      if(obj && typeof obj === 'object'){
+        if(Array.isArray(obj)){
+          for(let i=0;i<obj.length;i++) recurse(obj[i], path.concat([i]));
+        } else {
+          for(const k of Object.keys(obj)){
+            const v = obj[k];
+            if(matchKey(k)){
+              const sval = (v === null ? 'null' : (typeof v === 'object' ? JSON.stringify(v) : String(v)));
+              const idx = findKeyOccurrenceInText(text, k, sval);
+              const line = (idx >= 0) ? text.slice(0, idx).split('\n').length : null;
+              results.push({ line: line || 0, name: sval, path: path.concat([k]).join('.') });
+            }
+            recurse(v, path.concat([k]));
+          }
+        }
+      }
+    }
+    recurse(parsed, []);
+    if(results.length === 0){
+      results.push(...regexScanForKeys(text));
+    }
+  } catch(e){
+    results.push(...regexScanForKeys(text));
+  }
+  results.sort((a,b)=> (a.line||0) - (b.line||0));
+  return results;
+}
+
+function findKeyOccurrenceInText(text, key, sval){
+  try{
+    const keyRx = new RegExp('\"' + escapeRegExp(key) + '\"\\s*:\\s*', 'i');
+    let match;
+    let startPos = 0;
+    while((match = keyRx.exec(text.slice(startPos)))){
+      const idx = startPos + match.index;
+      const tail = text.slice(idx, idx + 400);
+      if(sval && tail.indexOf(sval) !== -1) return idx + tail.indexOf(sval);
+      startPos = idx + 1;
+      if(startPos >= text.length) break;
+    }
+    const pos = text.search(keyRx);
+    return pos >= 0 ? pos : -1;
+  } catch(e){
+    return -1;
+  }
+}
+
+function regexScanForKeys(text){
+  const out = [];
+  const rx = /"(?:Titre|titre|Name|name)"\s*:\s*(?:"([^"]*?)"|([0-9.+-eE]+)|(?:true|false|null))/g;
+  for(const m of text.matchAll(rx)){
+    const raw = m[1] ?? m[2] ?? (m[0].match(/:\s*(true|false|null)/i)?.[1] ?? '');
+    const idx = m.index || 0;
+    const line = text.slice(0, idx).split('\n').length;
+    out.push({ line, name: String(raw), path: '' });
+  }
+  return out;
+}
+
+function escapeRegExp(s){ return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+function render(filter){
+  listEl.innerHTML = '';
+  const entries = Array.from(filesData.entries());
+  fileCountEl.textContent = entries.length + (entries.length <= 1 ? ' fichier' : ' fichiers');
+  let totalMatches = 0;
+  for(const [fname, { text, hits }] of entries){
+    if(!hits || hits.length === 0) continue;
+    const filtered = (!filter || !filter.trim()) ? hits : hits.filter(h => (h.name || '').toLowerCase().includes(filter.toLowerCase()));
+    if(filtered.length === 0) continue;
+    totalMatches += filtered.length;
+    const fb = document.createElement('div'); fb.className = 'file-block';
+    const head = document.createElement('div'); head.className = 'file-name'; head.textContent = fname + ' — ' + hits.length + ' trouvés';
+    fb.appendChild(head);
+    for(const it of filtered){
+      const row = document.createElement('div'); row.className = 'found-item';
+      const lineEl = document.createElement('div'); lineEl.className = 'line'; lineEl.textContent = 'Ligne ' + (it.line || '?');
+      const valEl = document.createElement('div'); valEl.className = 'value';
+      valEl.innerHTML = `<div style="font-weight:700;margin-bottom:4px">Nom :</div><div>${escapeHtml(it.name)}</div><div class="muted" style="margin-top:6px">Path: ${escapeHtml(it.path || '(inconnu)')}</div>`;
+      row.appendChild(lineEl);
+      row.appendChild(valEl);
+      fb.appendChild(row);
+    }
+    listEl.appendChild(fb);
+  }
+  if(listEl.children.length === 0){
+    listEl.innerHTML = '<div class="empty">Aucun résultat — charge des fichiers JSON contenant des clés "Titre"/"titre"/"Name"/"name".</div>';
+  }
+  matchCountEl.textContent = totalMatches + ' résultats';
+  displayCountEl.textContent = totalMatches;
+}
+
+function escapeHtml(s){ return String(s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+let searchTimer = null;
+searchInput.addEventListener('input', (e) => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => render(searchInput.value.trim()), 220);
+});
+searchInput.addEventListener('keydown', (e) => {
+  if(e.key === 'Escape'){ searchInput.value = ''; render(); }
+  if(e.key === 'Enter'){ render(searchInput.value.trim()); }
+});
+
+copyAllBtn.addEventListener('click', async () => {
+  const text = buildExportText();
+  try{
+    await navigator.clipboard.writeText(text);
+    alert('Tous les résultats copiés dans le presse-papier.');
+  }catch(e){
+    downloadText('tfstream-results.txt', text);
+  }
+});
+
+exportTxtBtn.addEventListener('click', () => {
+  const text = buildExportText();
+  downloadText('tfstream-results.txt', text);
+});
+
+clearBtn.addEventListener('click', () => {
+  if(!confirm('Effacer tous les fichiers chargés et résultats ?')) return;
+  filesData.clear();
+  render();
+});
+
+function buildExportText(){
+  const parts = [];
+  for(const [fname, { hits }] of filesData.entries()){
+    if(!hits || hits.length === 0) continue;
+    parts.push('Fichier: ' + fname);
+    hits.forEach(h => parts.push(`Ligne ${h.line}.  Nom: ${h.name}  (Path: ${h.path || 'inconnu'})`));
+    parts.push('');
+  }
+  return parts.join('\n');
+}
+
+function downloadText(filename, text){
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function addRemoteJson(url, name){
+  try{
+    const r = await fetch(url, { cache: 'no-store' });
+    if(!r.ok) return;
+    const txt = await r.text();
+    const hits = extractTitlesFromJsonText(txt);
+    filesData.set(name, { text: txt, hits });
+    render(searchInput.value.trim());
+  }catch(e){}
+}
+
+render();
+
+// automatically try to load the remote JSON at https://tf-stream.pages.dev/1.json
+addRemoteJson('https://tf-stream.pages.dev/1.json', '1.json (remote)');
+
+</script></body>
+</html>
